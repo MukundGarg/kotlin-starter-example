@@ -2,12 +2,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Permissions for audio recording and internet access -->
+    <!-- ─── TASK-002: ISL App Permissions ─────────────────────────────────────── -->
+    <!-- Camera: required for live hand gesture capture -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Front camera: declared as required — app has no function without it -->
+    <uses-feature
+        android:name="android.hardware.camera.front"
+        android:required="true" />
+
+    <!-- Internet: required for VLM (RunAnywhere) inference calls in Phase 1 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ──────────────────────────────────────────────────────────────────────── -->
+
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    
-    <!-- Hardware features (not required, but recommended) -->
+
     <uses-feature
         android:name="android.hardware.microphone"
         android:required="false" />
