@@ -90,6 +90,9 @@ dependencies {
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.support)
     implementation(libs.tensorflow.lite.task.vision)
+
+    // MediaPipe
+    implementation(libs.mediapipe.tasks.vision)
     
     // Testing
     testImplementation(libs.junit)

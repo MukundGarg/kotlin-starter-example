@@ -17,6 +17,7 @@ import android.content.Context
 import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
+import com.runanywhere.kotlin_starter_example.model.IslHandClassifier
 import com.runanywhere.kotlin_starter_example.vision.CameraManager
 import com.runanywhere.kotlin_starter_example.vision.DetectionResult
 import com.runanywhere.kotlin_starter_example.vision.SignLanguageDetector
@@ -119,7 +120,11 @@ class SignLanguageService(context: Context) {
     // ─────────────────────────────────────────────────────────────────────────
     // startDetection() — binds camera and begins the frame collection loop
     // ─────────────────────────────────────────────────────────────────────────
-    fun startDetection(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+    fun startDetection(
+        lifecycleOwner : LifecycleOwner,
+        previewView    : PreviewView,
+        classifier     : IslHandClassifier? = null   // null = use VLM only
+    ) {
         if (detectionJob?.isActive == true) {
             Log.d(TAG, "Detection already running — ignoring startDetection()")
             return
@@ -140,7 +145,11 @@ class SignLanguageService(context: Context) {
                         // releaseFrame() MUST be in the finally block.
                         // If it's inside the try, an exception leaves the gate
                         // permanently locked and the camera freezes forever.
-                        val result = detector.detectLetterWithConfidence(frame.jpegBytes)
+                        
+                        // Try local classifier first — fast + offline
+                        // Fall back to VLM if classifier returns null
+                        val result = classifier?.classify(frame.jpegBytes)
+                            ?: detector.detectLetterWithConfidence(frame.jpegBytes)
                         handleResult(result)
                     } finally {
                         cameraManager.releaseFrame()  // ALWAYS runs, even on exception
