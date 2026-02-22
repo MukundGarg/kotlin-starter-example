@@ -19,7 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.reduce
 import kotlinx.coroutines.withContext
 
-class SignLanguageDetector(private val context: Context) {
+class SignLanguageDetector(private val context: Context?) {
 
     companion object {
         private const val TAG             = "SignLanguageDetector"

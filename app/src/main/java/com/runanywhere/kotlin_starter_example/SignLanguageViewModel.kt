@@ -43,6 +43,11 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
         // Note: MIN_CONFIDENCE in SignLanguageDetector (0.40) is a coarser gate —
         // this is the finer gate applied during word-building.
         private const val DEBOUNCE_MIN_CONFIDENCE = 0.62f
+
+        // ─── TASK-014: Auto word boundary on hand absence ─────────────────────────────
+        // Frames of zero confidence before auto-confirming the current word.
+        // At ~2 frames/sec (500ms inter-frame delay) this = ~2 seconds of no hand.
+        private const val AUTO_WORD_BOUNDARY_FRAMES = 4
     }
 
     // ── Service — owns CameraManager + Detector ───────────────────────────────
@@ -109,10 +114,25 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
         viewModelScope.launch {
             service.rawConfidence.collect { confidence ->
                 _confidenceLevel.value = confidence
+
                 if (confidence == 0f) {
+                    // No hand visible this frame
                     _currentLetter.value = ""
                     zeroConfidenceFrames++
+
+                    // ── TASK-014: Auto word boundary ──────────────────────────────
+                    // If hand has been absent for AUTO_WORD_BOUNDARY_FRAMES consecutive
+                    // frames AND there is a word being built, confirm it automatically.
+                    if (zeroConfidenceFrames >= AUTO_WORD_BOUNDARY_FRAMES &&
+                        _currentWord.value.isNotBlank()
+                    ) {
+                        Log.i(TAG, "Auto word boundary triggered after " +
+                                   "$zeroConfidenceFrames zero-confidence frames")
+                        confirmWord()
+                        zeroConfidenceFrames = 0
+                    }
                 } else {
+                    // Hand is visible — reset the absence counter
                     zeroConfidenceFrames = 0
                 }
             }
@@ -211,13 +231,13 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
     // ─────────────────────────────────────────────────────────────────────────
     fun reset() {
         Log.d(TAG, "reset() called — clearing all state")
-        _currentLetter.value  = ""
-        _currentWord.value    = ""
+        _currentLetter.value   = ""
+        _currentWord.value     = ""
         _confidenceLevel.value = 0f
-        _wordHistory.value    = emptyList()
-        _latestResult.value   = null
+        _wordHistory.value     = emptyList()
+        _latestResult.value    = null
         recentLetters.clear()
-        zeroConfidenceFrames  = 0
+        zeroConfidenceFrames   = 0   // ← TASK-014: reset absence counter too
     }
 
     // ─────────────────────────────────────────────────────────────────────────

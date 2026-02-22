@@ -9,6 +9,7 @@
 
 package com.runanywhere.kotlin_starter_example.ui
 
+import android.content.Intent
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -42,8 +43,23 @@ fun SignLanguageScreen(
     val isWarmingUp       by viewModel.isWarmingUp.collectAsStateWithLifecycle()
     val isClassifierReady by viewModel.isClassifierReady.collectAsStateWithLifecycle()
 
+    // ─── TASK-016: Session export ─────────────────────────────────────────────
+    val context = LocalContext.current
+    val onShare: () -> Unit = {
+        val shareText = wordHistory.joinToString(" ").trim()
+        if (shareText.isNotBlank()) {
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, shareText)
+                putExtra(Intent.EXTRA_TITLE, "ISL Session")
+            }
+            context.startActivity(
+                Intent.createChooser(sendIntent, "Share ISL session")
+            )
+        }
+    }
+
     // ── Camera preview setup ───────────────────────────────────────────────
-    val context        = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val previewView    = remember { PreviewView(context) }
 
@@ -76,6 +92,8 @@ fun SignLanguageScreen(
         TopBarNewYork(
             isSdkInitialised = isSdkInitialised,
             detectionState   = state,
+            wordHistory      = wordHistory,
+            onShare          = onShare,
             modifier         = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
