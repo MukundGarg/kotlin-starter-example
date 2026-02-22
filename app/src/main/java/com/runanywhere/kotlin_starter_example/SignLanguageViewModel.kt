@@ -19,7 +19,9 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.runanywhere.kotlin_starter_example.model.IslHandClassifier
 import com.runanywhere.kotlin_starter_example.vision.DetectionResult
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -45,6 +47,9 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
 
     // ── Service — owns CameraManager + Detector ───────────────────────────────
     private val service = SignLanguageService(application)
+
+    // ─── TASK-012: Add classifier to ViewModel ────────────────────────────────────
+    private val classifier = IslHandClassifier(application)
 
     // ── Debounce accumulator ──────────────────────────────────────────────────
     // Stores the last N letter results. When all N match, the letter is committed.
@@ -81,6 +86,16 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
     private val _latestResult   = MutableStateFlow<DetectionResult?>(null)
     val latestResult: StateFlow<DetectionResult?> = _latestResult.asStateFlow()
 
+    // ─── TASK-013: Warmup state added to ViewModel ────────────────────────────────
+    // Warmup: true while the classifier is JIT-compiling on first run
+    // Drives WarmupBannerNewYork visibility in SignLanguageScreen
+    private val _isWarmingUp = MutableStateFlow(false)
+    val isWarmingUp: StateFlow<Boolean> = _isWarmingUp.asStateFlow()
+
+    // Add this new StateFlow to track classifier readiness:
+    private val _isClassifierReady = MutableStateFlow(false)
+    val isClassifierReady: StateFlow<Boolean> = _isClassifierReady.asStateFlow()
+
     // ── Init: bridge service state and results into ViewModel flows ───────────
     init {
         // Mirror service state into ViewModel's state flow
@@ -110,6 +125,32 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
             }
         }
 
+        // ─── TASK-013: Replace the existing classifier init block with this ───────────
+        viewModelScope.launch {
+            // Step 1 — Show warmup banner
+            _isWarmingUp.value = true
+            _state.value = DetectionState.Idle
+            Log.d(TAG, "Warmup started")
+
+            // Step 2 — Load the MediaPipe model from assets
+            val initialised = classifier.initialise()
+
+            if (initialised) {
+                // Step 3 — Run one dummy inference to JIT-compile the runtime
+                // Uses a 224×224 blank bitmap (standard vision model input size)
+                // This silently "warms up" the TFLite/MediaPipe interpreter so
+                // the first real detection frame has no startup latency
+                warmup()
+            } else {
+                Log.w(TAG, "Classifier failed to initialise — VLM fallback will be used")
+                _isClassifierReady.value = false
+            }
+
+            // Step 4 — Hide warmup banner regardless of outcome
+            _isWarmingUp.value = false
+            Log.d(TAG, "Warmup complete — ready for detection")
+        }
+
         Log.d(TAG, "ViewModel initialised — service ready")
     }
 
@@ -121,19 +162,17 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
     // ─────────────────────────────────────────────────────────────────────────
     fun bindCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
         Log.d(TAG, "bindCamera() called")
-        service.startDetection(lifecycleOwner, previewView)
+        service.startDetection(lifecycleOwner, previewView, classifier)
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // startDetection() — (re)starts the detection loop
-    //
-    // Safe to call multiple times — service guards against double-start.
-    // Pass isSdkInitialised from MainActivity to gate VLM calls.
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─── TASK-013: Guard startDetection() behind warmup completion ───────────────
     fun startDetection() {
+        if (_isWarmingUp.value) {
+            Log.w(TAG, "startDetection() called during warmup — ignoring")
+            return
+        }
         Log.d(TAG, "startDetection() called")
-        // Service internally checks if already running
-        // SDK guard is enforced in SignLanguageDetector.callVlm()
+        service.startPipeline(classifier)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -229,12 +268,48 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    // ─── TASK-013: Warmup function ────────────────────────────────────────────────
+    // Runs one dummy inference through the classifier immediately after init.
+    // The MediaPipe runtime JIT-compiles on first call — doing this on a blank
+    // frame means the user never sees the freeze on their first real sign.
+    //
+    // A minimum display time of 1 second is enforced so the banner is readable
+    // and doesn't flash briefly on fast devices.
+    private suspend fun warmup() {
+        val warmupStart = System.currentTimeMillis()
+
+        try {
+            Log.d(TAG, "Running warmup inference on blank frame")
+
+            // Blank 224×224×3 byte array — enough to trigger JIT compilation
+            // without needing a real image or camera frame
+            classifier.runInference(ByteArray(224 * 224 * 3))
+
+            _isClassifierReady.value = true
+            Log.i(TAG, "Warmup inference succeeded — classifier ready")
+
+        } catch (e: Exception) {
+            // Warmup failure is non-fatal — VLM fallback remains active
+            _isClassifierReady.value = false
+            Log.w(TAG, "Warmup inference failed (non-fatal): ${e.message}")
+        }
+
+        // Enforce a minimum banner display time so it's readable on fast devices
+        // If warmup took longer than MIN_DISPLAY_MS, this delay is skipped
+        val elapsed = System.currentTimeMillis() - warmupStart
+        val MIN_DISPLAY_MS = 1_200L
+        if (elapsed < MIN_DISPLAY_MS) {
+            delay(MIN_DISPLAY_MS - elapsed)
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // onCleared() — ViewModel is being destroyed; release all resources
     // ─────────────────────────────────────────────────────────────────────────
     override fun onCleared() {
         super.onCleared()
         service.release()
-        Log.d(TAG, "ViewModel cleared — service released")
+        classifier.close()
+        Log.d(TAG, "ViewModel cleared — service and classifier released")
     }
 }

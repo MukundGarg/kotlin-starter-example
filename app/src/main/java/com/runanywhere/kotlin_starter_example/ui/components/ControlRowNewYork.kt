@@ -1,4 +1,4 @@
-// ─── TASK-011: ControlRowNewYork — Start / Stop / Reset / Confirm buttons ──────
+// ─── TASK-013: Disable Start button during warmup ─────────────────────────────
 
 package com.runanywhere.kotlin_starter_example.ui.components
 
@@ -19,13 +19,14 @@ import com.runanywhere.kotlin_starter_example.DetectionState
 @Composable
 fun ControlRowNewYork(
     detectionState : DetectionState,
+    modifier       : Modifier = Modifier,
+    isWarmingUp    : Boolean = false,
     onStart        : () -> Unit,
     onStop         : () -> Unit,
     onReset        : () -> Unit,
-    onConfirm      : () -> Unit,
-    modifier       : Modifier = Modifier
+    onConfirm      : () -> Unit
 ) {
-    val isDetecting = detectionState is DetectionState.Detecting ||
+    val isDetecting = detectionState is DetectionState.Detecting  ||
                       detectionState is DetectionState.Processing ||
                       detectionState is DetectionState.BufferingWord
 
@@ -33,28 +34,37 @@ fun ControlRowNewYork(
         modifier              = modifier,
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // ── Start / Stop (toggle) ──────────────────────────────────────────
+        // ── Start / Stop (disabled during warmup) ─────────────────────────
         Button(
-            onClick = if (isDetecting) onStop else onStart,
-            colors  = ButtonDefaults.buttonColors(
-                containerColor = if (isDetecting) Color(0xFFE53935) else Color(0xFF6C63FF)
+            onClick  = if (isDetecting) onStop else onStart,
+            enabled  = !isWarmingUp,   // ← grayed out while model loads
+            colors   = ButtonDefaults.buttonColors(
+                containerColor        = if (isDetecting) Color(0xFFE53935)
+                                        else Color(0xFF6C63FF),
+                disabledContainerColor = Color(0xFF3A3A4E)
             ),
             shape    = RoundedCornerShape(12.dp),
             modifier = Modifier.weight(1f)
         ) {
             Text(
-                text       = if (isDetecting) "Stop" else "Start",
+                text       = when {
+                    isWarmingUp  -> "Loading…"
+                    isDetecting  -> "Stop"
+                    else         -> "Start"
+                },
                 fontWeight = FontWeight.SemiBold,
                 fontSize   = 14.sp,
-                color      = Color.White
+                color      = if (isWarmingUp) Color(0xFF6A6A8A) else Color.White
             )
         }
 
         // ── Confirm word ───────────────────────────────────────────────────
         Button(
             onClick  = onConfirm,
+            enabled  = !isWarmingUp,
             colors   = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF43A047)
+                containerColor         = Color(0xFF43A047),
+                disabledContainerColor = Color(0xFF2A3A2A)
             ),
             shape    = RoundedCornerShape(12.dp),
             modifier = Modifier.weight(1f)
@@ -63,7 +73,7 @@ fun ControlRowNewYork(
                 text       = "Confirm",
                 fontWeight = FontWeight.SemiBold,
                 fontSize   = 14.sp,
-                color      = Color.White
+                color      = if (isWarmingUp) Color(0xFF4A6A4A) else Color.White
             )
         }
 

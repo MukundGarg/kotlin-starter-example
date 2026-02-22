@@ -38,6 +38,10 @@ fun SignLanguageScreen(
     val wordHistory     by viewModel.wordHistory.collectAsStateWithLifecycle()
     val latestResult    by viewModel.latestResult.collectAsStateWithLifecycle()
 
+    // ─── TASK-013: Add warmup flow collection to SignLanguageScreen ───────────────
+    val isWarmingUp       by viewModel.isWarmingUp.collectAsStateWithLifecycle()
+    val isClassifierReady by viewModel.isClassifierReady.collectAsStateWithLifecycle()
+
     // ── Camera preview setup ───────────────────────────────────────────────
     val context        = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -47,9 +51,6 @@ fun SignLanguageScreen(
     LaunchedEffect(Unit) {
         viewModel.bindCamera(lifecycleOwner, previewView)
     }
-
-    // ── Warmup banner visibility ───────────────────────────────────────────
-    val isWarmingUp = state is DetectionState.Idle && !isSdkInitialised
 
     // ── Root layout: full-screen black background ──────────────────────────
     Box(
@@ -80,15 +81,16 @@ fun SignLanguageScreen(
                 .align(Alignment.TopCenter)
         )
 
-        // Layer 4 — Warmup banner (shown while SDK is loading)
-        if (isWarmingUp) {
-            WarmupBannerNewYork(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 72.dp)
-                    .align(Alignment.TopCenter)
-            )
-        }
+        // Layer 4 — Warmup banner (enhanced for TASK-013)
+        WarmupBannerNewYork(
+            isWarmingUp       = isWarmingUp,
+            isClassifierReady = isClassifierReady,
+            isSdkInitialised  = isSdkInitialised,
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(top = 72.dp)
+                .align(Alignment.TopCenter)
+        )
 
         // Layer 5 — Bottom panel: confidence bar + word HUD + controls
         Column(
@@ -121,6 +123,7 @@ fun SignLanguageScreen(
             // Control row: Start / Stop / Reset / Confirm buttons
             ControlRowNewYork(
                 detectionState = state,
+                isWarmingUp    = isWarmingUp,
                 onStart        = { viewModel.startDetection() },
                 onStop         = { viewModel.stopDetection()  },
                 onReset        = { viewModel.reset()          },

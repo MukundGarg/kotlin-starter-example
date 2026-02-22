@@ -45,20 +45,43 @@ class CameraManager(private val context: Context) {
     }
 
     // ── Single-thread executor for ImageAnalysis callbacks ────────────────────
-    // Must NOT be shut down on stopDetection() — only in release().
-    // Shutting it down early orphans the ImageAnalysis use-case and
-    // causes "Frame gate reopened" to stop appearing in Logcat.
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     // ── Gate: true while a detection call is in-flight ────────────────────────
-    // Set to true when a frame is emitted; reset via releaseFrame() in
-    // SignLanguageService's finally block. This limits concurrent VLM calls to 1.
     private val detectionRunning = AtomicBoolean(false)
 
     private var cameraProvider: ProcessCameraProvider? = null
 
     // ─────────────────────────────────────────────────────────────────────────
-    // frameStream() — binds the camera and emits SignLanguageFrame objects
+    // bindPreview() — binds ONLY the preview use-case (TASK-013)
+    // ─────────────────────────────────────────────────────────────────────────
+    fun bindPreview(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+        val providerFuture = ProcessCameraProvider.getInstance(context)
+        providerFuture.addListener({
+            val provider = providerFuture.get()
+            cameraProvider = provider
+
+            val preview = Preview.Builder()
+                .build()
+                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+            val cameraSelector = CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
+                .build()
+
+            try {
+                // unbindAll() here ensures we start fresh
+                provider.unbindAll()
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview)
+                Log.d(TAG, "Camera preview bound")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to bind camera preview: ${e.message}", e)
+            }
+        }, ContextCompat.getMainExecutor(context))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // frameStream() — binds the camera (including preview) and emits frames
     // ─────────────────────────────────────────────────────────────────────────
     fun frameStream(
         lifecycleOwner: LifecycleOwner,
@@ -85,7 +108,6 @@ class CameraManager(private val context: Context) {
 
             imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
                 processFrame(imageProxy) { frame ->
-                    // trySend is safe from any thread; drops silently if channel closed
                     trySend(frame)
                 }
             }
@@ -96,7 +118,7 @@ class CameraManager(private val context: Context) {
                 .build()
 
             try {
-                provider.unbindAll()
+                // bindToLifecycle adds these use cases to any already bound
                 provider.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
@@ -111,17 +133,14 @@ class CameraManager(private val context: Context) {
 
         }, ContextCompat.getMainExecutor(context))
 
-        // Clean up when the flow is cancelled (lifecycle destroyed, stopDetection called)
         awaitClose {
-            Log.d(TAG, "frameStream closed — unbinding camera")
-            cameraProvider?.unbindAll()
+            Log.d(TAG, "frameStream closed")
+            // Note: We don't unbindAll() here to allow preview to continue
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // releaseFrame() — called from SignLanguageService's finally block.
-    // MUST be called after every emitted frame, even on exception, or the
-    // AtomicBoolean gate permanently blocks all subsequent frames.
     // ─────────────────────────────────────────────────────────────────────────
     fun releaseFrame() {
         detectionRunning.set(false)
@@ -141,7 +160,6 @@ class CameraManager(private val context: Context) {
     // processFrame() — internal: gates, converts, rotates, emits
     // ─────────────────────────────────────────────────────────────────────────
     private fun processFrame(imageProxy: ImageProxy, onFrame: (SignLanguageFrame) -> Unit) {
-        // Gate: skip this frame if a detection call is already running
         if (!detectionRunning.compareAndSet(false, true)) {
             imageProxy.close()
             return
@@ -149,11 +167,8 @@ class CameraManager(private val context: Context) {
 
         try {
             val rotation = imageProxy.imageInfo.rotationDegrees
-
-            // Step 1: Convert YUV_420_888 → NV21 byte array (pixel-by-pixel — safe)
             val nv21 = yuv420ToNv21(imageProxy)
 
-            // Step 2: NV21 → JPEG via YuvImage
             val yuvImage = YuvImage(
                 nv21,
                 ImageFormat.NV21,
@@ -169,7 +184,6 @@ class CameraManager(private val context: Context) {
             )
             val rawJpeg = jpegStream.toByteArray()
 
-            // Step 3: Rotate the bitmap to upright so the VLM sees a correct hand
             val uprightJpeg = if (rotation != 0) rotateJpeg(rawJpeg, rotation) else rawJpeg
 
             val frame = SignLanguageFrame(
@@ -183,21 +197,12 @@ class CameraManager(private val context: Context) {
 
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing error: ${e.message}", e)
-            // Gate must be released on exception — otherwise camera freezes
             detectionRunning.set(false)
         } finally {
             imageProxy.close()
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // yuv420ToNv21() — safe pixel-by-pixel extraction
-    //
-    // WHY: CameraX YUV_420_888 planes can have pixelStride > 1 and
-    // rowStride > width. Using buffer.array() directly copies padding bytes
-    // and produces black or green corrupt images on real devices.
-    // This loop extracts only the real pixel bytes.
-    // ─────────────────────────────────────────────────────────────────────────
     private fun yuv420ToNv21(imageProxy: ImageProxy): ByteArray {
         val width  = imageProxy.width
         val height = imageProxy.height
@@ -209,7 +214,6 @@ class CameraManager(private val context: Context) {
 
         var i = 0
 
-        // ── Y plane (luma) ────────────────────────────────────────────────────
         for (row in 0 until height) {
             val base = row * yPlane.rowStride
             for (col in 0 until width) {
@@ -217,8 +221,6 @@ class CameraManager(private val context: Context) {
             }
         }
 
-        // ── VU interleaved (chroma) ───────────────────────────────────────────
-        // NV21 interleaves V then U. CameraX gives separate U and V planes.
         val chromaHeight = height / 2
         val chromaWidth  = width  / 2
         for (row in 0 until chromaHeight) {
@@ -233,10 +235,6 @@ class CameraManager(private val context: Context) {
         return nv21
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // rotateJpeg() — rotates a JPEG byte array by the given degrees
-    // Used to upright the frame before sending to the VLM
-    // ─────────────────────────────────────────────────────────────────────────
     private fun rotateJpeg(jpegBytes: ByteArray, degrees: Int): ByteArray {
         val bitmap  = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
         val matrix  = Matrix().apply { postRotate(degrees.toFloat()) }

@@ -4,7 +4,7 @@
 // Changes:
 //   • DetectionState drives the full state machine (Idle → Detecting →
 //     Processing → Detecting → …)
-//   • SupervisorJob scope means one failed detection doesn't cancel the pipeline
+//   • SupervisorJob scope means one failed detection coroutine does NOT cancel the pipeline
 //   • releaseFrame() is ALWAYS called in a finally block — any other placement
 //     causes the AtomicBoolean gate to deadlock and freezes the camera
 //   • 500ms inter-frame delay caps VLM API calls at ~2/sec, preventing overheating
@@ -94,8 +94,6 @@ class SignLanguageService(context: Context) {
     private val detector      = SignLanguageDetector(context)
 
     // ── SupervisorJob scope ───────────────────────────────────────────────────
-    // SupervisorJob: one failed detection coroutine does NOT cancel the pipeline.
-    // IO dispatcher: VLM network call is blocking-ish; keep off Main thread.
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var detectionJob: Job? = null
 
@@ -103,70 +101,88 @@ class SignLanguageService(context: Context) {
     // Exposed flows — collected by SignLanguageViewModel
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Full pipeline state machine
     private val _state = MutableStateFlow<DetectionState>(DetectionState.Idle)
     val state: StateFlow<DetectionState> = _state.asStateFlow()
 
-    // Non-null DetectionResults only — null frames are swallowed here
     private val _detectionResults = MutableSharedFlow<DetectionResult>(
-        extraBufferCapacity = 8  // prevents suspension if ViewModel is slow to collect
+        extraBufferCapacity = 8
     )
     val detectionResults: SharedFlow<DetectionResult> = _detectionResults.asSharedFlow()
 
-    // Raw confidence — resets to 0.0 when no hand detected (drives ConfidenceBar)
     private val _rawConfidence = MutableStateFlow(0f)
     val rawConfidence: StateFlow<Float> = _rawConfidence.asStateFlow()
 
+    // ── State storage for TASK-013 ───────────────────────────────────────────
+    private var isDetectionRunning = false
+    private var lifecycleOwner: LifecycleOwner? = null
+    private var previewView: PreviewView? = null
+
     // ─────────────────────────────────────────────────────────────────────────
-    // startDetection() — binds camera and begins the frame collection loop
+    // startDetection(lifecycle, preview) — binds camera ONLY (TASK-013)
     // ─────────────────────────────────────────────────────────────────────────
     fun startDetection(
         lifecycleOwner : LifecycleOwner,
         previewView    : PreviewView,
-        classifier     : IslHandClassifier? = null   // null = use VLM only
+        classifier     : IslHandClassifier? = null
     ) {
-        if (detectionJob?.isActive == true) {
-            Log.d(TAG, "Detection already running — ignoring startDetection()")
+        this.lifecycleOwner = lifecycleOwner
+        this.previewView = previewView
+        Log.d(TAG, "Binding camera preview")
+        cameraManager.bindPreview(lifecycleOwner, previewView)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // startPipeline() — (TASK-013) begins the frame collection loop
+    // ─────────────────────────────────────────────────────────────────────────
+    fun startPipeline(classifier: IslHandClassifier? = null) {
+        val lo = lifecycleOwner ?: run {
+            Log.w(TAG, "startPipeline called before lifecycleOwner set")
+            return
+        }
+        val pv = previewView ?: run {
+            Log.w(TAG, "startPipeline called before previewView set")
+            return
+        }
+
+        if (isDetectionRunning) {
+            Log.d(TAG, "Detection already running — ignoring startPipeline()")
             return
         }
 
         Log.d(TAG, "Starting detection pipeline")
+        isDetectionRunning = true
         _state.value = DetectionState.Detecting
 
         detectionJob = serviceScope.launch {
             cameraManager
-                .frameStream(lifecycleOwner, previewView)
+                .frameStream(lo, pv)
                 .collect { frame ->
                     _state.value = DetectionState.Processing
                     Log.d(TAG, "Frame received — calling detector")
 
                     try {
-                        // ── THE CRITICAL PATTERN ─────────────────────────────
-                        // releaseFrame() MUST be in the finally block.
-                        // If it's inside the try, an exception leaves the gate
-                        // permanently locked and the camera freezes forever.
-                        
-                        // Try local classifier first — fast + offline
-                        // Fall back to VLM if classifier returns null
                         val result = classifier?.classify(frame.jpegBytes)
                             ?: detector.detectLetterWithConfidence(frame.jpegBytes)
                         handleResult(result)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Detection error: ${e.message}", e)
                     } finally {
-                        cameraManager.releaseFrame()  // ALWAYS runs, even on exception
-                        delay(INTER_FRAME_DELAY_MS)   // throttle to ~2 API calls/sec
-                        _state.value = DetectionState.Detecting
-                        Log.d(TAG, "State: ${_state.value}")
+                        cameraManager.releaseFrame()
+                        delay(INTER_FRAME_DELAY_MS)
+                        if (isDetectionRunning) {
+                            _state.value = DetectionState.Detecting
+                        }
                     }
                 }
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // stopDetection() — cancels the frame loop, leaves camera provider alive
-    // so preview continues rendering while idle
+    // stopDetection() — cancels the frame loop
     // ─────────────────────────────────────────────────────────────────────────
     fun stopDetection() {
         Log.d(TAG, "Stopping detection")
+        isDetectionRunning = false
         detectionJob?.cancel()
         detectionJob = null
         _state.value  = DetectionState.Idle
@@ -188,12 +204,13 @@ class SignLanguageService(context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // release() — called from ViewModel.onCleared() ONLY
-    // Shuts down the executor and unbinds the camera
+    // release() — shuts down the executor and unbinds the camera
     // ─────────────────────────────────────────────────────────────────────────
     fun release() {
         stopDetection()
         cameraManager.release()
+        lifecycleOwner = null
+        previewView = null
         Log.d(TAG, "SignLanguageService released")
     }
 
@@ -206,7 +223,6 @@ class SignLanguageService(context: Context) {
             _detectionResults.emit(result)
             Log.i(TAG, "Result routed → $result")
         } else {
-            // No hand visible or confidence too low — reset confidence bar
             _rawConfidence.value = 0f
             Log.d(TAG, "No detection this frame — confidence reset to 0")
         }
