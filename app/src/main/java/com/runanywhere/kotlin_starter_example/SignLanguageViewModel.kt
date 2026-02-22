@@ -177,12 +177,13 @@ class SignLanguageViewModel(application: Application) : AndroidViewModel(applica
     // ─────────────────────────────────────────────────────────────────────────
     // bindCamera() — called once from SignLanguageScreen's LaunchedEffect
     //
-    // Must be called BEFORE startDetection(). The PreviewView must be
-    // attached to the composition before this is called.
+    // CRITICAL: Immediately starts frameStream collection to bind camera and
+    // show preview. The camera must be bound for preview to be visible.
+    // Frame processing only happens when detection is started via startDetection().
     // ─────────────────────────────────────────────────────────────────────────
     fun bindCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        Log.d(TAG, "bindCamera() called")
-        service.startDetection(lifecycleOwner, previewView, classifier)
+        Log.d(TAG, "bindCamera() called — starting camera binding")
+        service.bindCameraAndStartStream(lifecycleOwner, previewView, classifier)
     }
 
     // ─── TASK-013: Guard startDetection() behind warmup completion ───────────────

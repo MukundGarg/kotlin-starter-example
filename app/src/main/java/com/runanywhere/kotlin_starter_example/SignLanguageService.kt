@@ -118,45 +118,36 @@ class SignLanguageService(context: Context) {
     private var previewView: PreviewView? = null
 
     // ─────────────────────────────────────────────────────────────────────────
-    // startDetection(lifecycle, preview) — binds camera ONLY (TASK-013)
+    // bindCameraAndStartStream() — SINGLE camera binding point
+    // 
+    // Called once when the screen is composed. Immediately binds the camera
+    // via frameStream() so preview is visible. Frames are collected but only
+    // processed when isDetectionRunning is true (set by startPipeline).
     // ─────────────────────────────────────────────────────────────────────────
-    fun startDetection(
+    fun bindCameraAndStartStream(
         lifecycleOwner : LifecycleOwner,
         previewView    : PreviewView,
         classifier     : IslHandClassifier? = null
     ) {
         this.lifecycleOwner = lifecycleOwner
         this.previewView = previewView
-        Log.d(TAG, "Binding camera preview")
-        cameraManager.bindPreview(lifecycleOwner, previewView)
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // startPipeline() — (TASK-013) begins the frame collection loop
-    // ─────────────────────────────────────────────────────────────────────────
-    fun startPipeline(classifier: IslHandClassifier? = null) {
-        val lo = lifecycleOwner ?: run {
-            Log.w(TAG, "startPipeline called before lifecycleOwner set")
-            return
-        }
-        val pv = previewView ?: run {
-            Log.w(TAG, "startPipeline called before previewView set")
-            return
-        }
-
-        if (isDetectionRunning) {
-            Log.d(TAG, "Detection already running — ignoring startPipeline()")
-            return
-        }
-
-        Log.d(TAG, "Starting detection pipeline")
-        isDetectionRunning = true
-        _state.value = DetectionState.Detecting
-
+        
+        Log.d(TAG, "Binding camera and starting frame stream")
+        
+        // Start frame collection immediately
+        // This binds the camera (making preview visible)
+        // but frames are only processed when isDetectionRunning = true
         detectionJob = serviceScope.launch {
             cameraManager
-                .frameStream(lo, pv)
+                .frameStream(lifecycleOwner, previewView)
                 .collect { frame ->
+                    // Only process frames when detection is active
+                    if (!isDetectionRunning) {
+                        Log.d(TAG, "Frame received but detection inactive — skipping")
+                        cameraManager.releaseFrame()
+                        return@collect
+                    }
+                    
                     _state.value = DetectionState.Processing
                     Log.d(TAG, "Frame received — calling detector")
 
@@ -175,6 +166,25 @@ class SignLanguageService(context: Context) {
                     }
                 }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // startPipeline() — begins frame processing (camera already bound)
+    // ─────────────────────────────────────────────────────────────────────────
+    fun startPipeline(classifier: IslHandClassifier? = null) {
+        if (isDetectionRunning) {
+            Log.d(TAG, "Detection already running — ignoring startPipeline()")
+            return
+        }
+
+        if (detectionJob == null) {
+            Log.w(TAG, "startPipeline called before camera binding — call bindCameraAndStartStream first")
+            return
+        }
+
+        Log.d(TAG, "Starting frame processing")
+        isDetectionRunning = true
+        _state.value = DetectionState.Detecting
     }
 
     // ─────────────────────────────────────────────────────────────────────────

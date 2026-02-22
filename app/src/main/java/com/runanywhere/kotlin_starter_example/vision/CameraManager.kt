@@ -53,36 +53,23 @@ class CameraManager(private val context: Context) {
     private var cameraProvider: ProcessCameraProvider? = null
 
     // ─────────────────────────────────────────────────────────────────────────
-    // bindPreview() — binds ONLY the preview use-case (TASK-013)
+    // bindPreview() — REMOVED: This method caused double-binding crashes.
+    // Camera is now bound ONLY through frameStream() to prevent conflicts.
     // ─────────────────────────────────────────────────────────────────────────
+    // This method is kept as a no-op stub for API compatibility but does nothing.
+    @Deprecated("No longer used — camera binding happens in frameStream() only")
     fun bindPreview(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        val providerFuture = ProcessCameraProvider.getInstance(context)
-        providerFuture.addListener({
-            val provider = providerFuture.get()
-            cameraProvider = provider
-
-            val preview = Preview.Builder()
-                .build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-            val cameraSelector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
-                .build()
-
-            try {
-                // unbindAll() here ensures we start fresh
-                provider.unbindAll()
-                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview)
-                Log.d(TAG, "Camera preview bound")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to bind camera preview: ${e.message}", e)
-            }
-        }, ContextCompat.getMainExecutor(context))
+        Log.d(TAG, "bindPreview() called but is deprecated — camera will bind via frameStream()")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // frameStream() — binds the camera (including preview) and emits frames
+    // frameStream() — SINGLE BINDING POINT for camera (Preview + ImageAnalysis)
     // ─────────────────────────────────────────────────────────────────────────
+    // This is the ONLY method that binds camera use-cases. It binds both Preview
+    // and ImageAnalysis together in a single bindToLifecycle() call.
+    //
+    // CRITICAL: This Flow must be collected ONCE and kept active for the entire
+    // camera session. Compose recomposition MUST NOT trigger multiple collections.
     fun frameStream(
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView
@@ -112,20 +99,30 @@ class CameraManager(private val context: Context) {
                 }
             }
 
-            // ── Front camera selector ─────────────────────────────────────────
-            val cameraSelector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
-                .build()
+            // ── FIXED: Defensive camera selector ─────────────────────────────────
+            val cameraSelector = selectBestCamera(provider)
+
+            if (cameraSelector == null) {
+                Log.e(TAG, "No camera available on this device/emulator")
+                close(IllegalStateException(
+                    "No camera found. If running on an emulator, enable a " +
+                    "virtual camera in AVD Manager → Advanced → Front Camera."
+                ))
+                return@addListener
+            }
 
             try {
-                // bindToLifecycle adds these use cases to any already bound
+                // CRITICAL: unbindAll() first to prevent any conflicts from previous bindings
+                provider.unbindAll()
+                
+                // Single atomic bind of both use-cases
                 provider.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
                     preview,
                     imageAnalysis
                 )
-                Log.d(TAG, "Camera use-cases bound (preview + imageAnalysis)")
+                Log.i(TAG, "Camera bound successfully (Preview + ImageAnalysis)")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to bind camera use-cases: ${e.message}", e)
                 close(e)
@@ -134,8 +131,46 @@ class CameraManager(private val context: Context) {
         }, ContextCompat.getMainExecutor(context))
 
         awaitClose {
-            Log.d(TAG, "frameStream closed")
-            // Note: We don't unbindAll() here to allow preview to continue
+            Log.d(TAG, "frameStream closed — keeping camera bound")
+        }
+    }
+
+    // ─── Defensive camera selection ───────────────────────────────────────────────
+    // Priority: front camera → back camera → any camera
+    // Uses hasCamera() before building the selector so we never hand CameraX
+    // a selector it cannot resolve, which is the root cause of the crash.
+    // ──────────────────────────────────────────────────────────────────────────────
+    private fun selectBestCamera(provider: ProcessCameraProvider): CameraSelector? {
+        val frontSelector = CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
+            .build()
+
+        val backSelector = CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+            .build()
+
+        return when {
+            // First choice: front camera (correct for ISL — signer faces screen)
+            provider.hasCamera(frontSelector) -> {
+                Log.d(TAG, "Camera selected: FRONT")
+                frontSelector
+            }
+            // Fallback: back camera (works on most emulators by default)
+            provider.hasCamera(backSelector) -> {
+                Log.w(TAG, "Front camera unavailable — falling back to BACK camera. " +
+                           "If on emulator: AVD Manager → Advanced → Front Camera → Emulated")
+                backSelector
+            }
+            // Last resort: let CameraX pick any available camera
+            else -> {
+                Log.w(TAG, "Neither front nor back camera resolved — using DEFAULT selector")
+                if (provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) ||
+                    provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                } else {
+                    null   // truly no camera — caller handles this
+                }
+            }
         }
     }
 
