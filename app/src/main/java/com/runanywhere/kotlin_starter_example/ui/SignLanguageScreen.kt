@@ -1,10 +1,11 @@
 // ─── TASK-011: SignLanguageScreen — root composable, wires ViewModel → UI ─────
 // Changes:
-//   • Binds PreviewView to ViewModel via LaunchedEffect (once, on composition)
-//   • Collects all 6 StateFlows with collectAsStateWithLifecycle
-//   • Layers camera preview, gesture overlay, word HUD, confidence bar,
-//     top bar, warmup banner, and control row
-//   • Does NOT modify any child composable — only wires them together
+//   • FIXED: Camera preview visibility.
+//   • Followed Quick Fix Checklist:
+//     1. Wrap PreviewView in AndroidView and store reference via mutableState.
+//     2. Use LocalLifecycleOwner.current for binding.
+//     3. Ensure bindCamera is called when the view reference is ready.
+//   • Improved layering to ensure GestureOverlay doesn't block interactions if needed.
 // ──────────────────────────────────────────────────────────────────────────────
 
 package com.runanywhere.kotlin_starter_example.ui
@@ -37,13 +38,11 @@ fun SignLanguageScreen(
     val confidenceLevel by viewModel.confidenceLevel.collectAsStateWithLifecycle()
     val state           by viewModel.state.collectAsStateWithLifecycle()
     val wordHistory     by viewModel.wordHistory.collectAsStateWithLifecycle()
-    val latestResult    by viewModel.latestResult.collectAsStateWithLifecycle()
 
-    // ─── TASK-013: Add warmup flow collection to SignLanguageScreen ───────────────
     val isWarmingUp       by viewModel.isWarmingUp.collectAsStateWithLifecycle()
     val isClassifierReady by viewModel.isClassifierReady.collectAsStateWithLifecycle()
 
-    // ─── TASK-016: Session export ─────────────────────────────────────────────
+    // ── Session export ─────────────────────────────────────────────────────
     val context = LocalContext.current
     val onShare: () -> Unit = {
         val shareText = wordHistory.joinToString(" ").trim()
@@ -53,103 +52,111 @@ fun SignLanguageScreen(
                 putExtra(Intent.EXTRA_TEXT, shareText)
                 putExtra(Intent.EXTRA_TITLE, "ISL Session")
             }
-            context.startActivity(
-                Intent.createChooser(sendIntent, "Share ISL session")
-            )
+            context.startActivity(Intent.createChooser(sendIntent, "Share ISL session"))
         }
     }
 
     // ── Camera preview setup ───────────────────────────────────────────────
     val lifecycleOwner = LocalLifecycleOwner.current
-    val previewView    = remember { PreviewView(context) }
+    
+    // Store a reference to the PreviewView created by AndroidView
+    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
 
-    // Bind camera once when the composable first enters composition
-    LaunchedEffect(Unit) {
-        viewModel.bindCamera(lifecycleOwner, previewView)
+    // Bind camera whenever the view reference is set or changed
+    LaunchedEffect(previewViewRef, lifecycleOwner) {
+        previewViewRef?.let { view ->
+            viewModel.bindCamera(lifecycleOwner, view)
+        }
     }
 
-    // ── Root layout: full-screen black background ──────────────────────────
+    // ── Root layout ────────────────────────────────────────────────────────
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
     ) {
 
-        // Layer 1 — Camera preview (fills entire screen)
+        // Layer 1 — Camera preview
         AndroidView(
-            factory  = { previewView },
-            modifier = Modifier.fillMaxSize()
+            factory = { ctx ->
+                PreviewView(ctx).apply {
+                    // TextureView (COMPATIBLE) is better for Compose overlays
+                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }.also {
+                    previewViewRef = it
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+            update = { /* No-op: binding handled in LaunchedEffect */ }
         )
 
-        // Layer 2 — Gesture overlay (letter + confidence badge over camera)
+        // Layer 2 — Gesture overlay (letter + confidence badge)
         GestureOverlay(
             detectedLetter  = currentLetter,
             confidenceLevel = confidenceLevel,
             modifier        = Modifier.fillMaxSize()
         )
 
-        // Layer 3 — Top bar (app title + SDK status indicator)
-        TopBarNewYork(
-            isSdkInitialised = isSdkInitialised,
-            detectionState   = state,
-            wordHistory      = wordHistory,
-            onShare          = onShare,
-            modifier         = Modifier
-                .fillMaxWidth()
-                .align(Alignment.TopCenter)
-        )
-
-        // Layer 4 — Warmup banner (enhanced for TASK-013)
-        WarmupBannerNewYork(
-            isWarmingUp       = isWarmingUp,
-            isClassifierReady = isClassifierReady,
-            isSdkInitialised  = isSdkInitialised,
-            modifier          = Modifier
-                .fillMaxWidth()
-                .padding(top = 72.dp)
-                .align(Alignment.TopCenter)
-        )
-
-        // Layer 5 — Bottom panel: confidence bar + word HUD + controls
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .align(Alignment.BottomCenter)
-                .background(Color(0xCC0D0D1A))  // semi-transparent dark
-                .padding(bottom = 24.dp)
-        ) {
-            // Confidence bar sits just above the word HUD
-            ConfidenceBar(
-                confidenceLevel = confidenceLevel,
-                modifier        = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp, vertical = 8.dp)
+        // Layer 3 — UI Panels (Top Bar, Warmup, Bottom Panel)
+        Column(modifier = Modifier.fillMaxSize()) {
+            
+            TopBarNewYork(
+                isSdkInitialised = isSdkInitialised,
+                detectionState   = state,
+                wordHistory      = wordHistory,
+                onShare          = onShare,
+                modifier         = Modifier.fillMaxWidth()
             )
 
-            // Word builder: shows current letter, current word, history
-            WordBuilderHud(
-                currentLetter = currentLetter,
-                currentWord   = currentWord,
-                wordHistory   = wordHistory,
-                modifier      = Modifier
+            WarmupBannerNewYork(
+                isWarmingUp       = isWarmingUp,
+                isClassifierReady = isClassifierReady,
+                isSdkInitialised  = isSdkInitialised,
+                modifier          = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 24.dp)
+                    .padding(top = 8.dp)
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.weight(1f))
 
-            // Control row: Start / Stop / Reset / Confirm buttons
-            ControlRowNewYork(
-                detectionState = state,
-                isWarmingUp    = isWarmingUp,
-                onStart        = { viewModel.startDetection() },
-                onStop         = { viewModel.stopDetection()  },
-                onReset        = { viewModel.reset()          },
-                onConfirm      = { viewModel.confirmWord()    },
-                modifier       = Modifier
+            // Bottom panel
+            Column(
+                modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-            )
+                    .background(Color(0xCC0D0D1A))
+                    .padding(bottom = 24.dp)
+            ) {
+                ConfidenceBar(
+                    confidenceLevel = confidenceLevel,
+                    modifier        = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                )
+
+                WordBuilderHud(
+                    currentLetter = currentLetter,
+                    currentWord   = currentWord,
+                    wordHistory   = wordHistory,
+                    modifier      = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp)
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                ControlRowNewYork(
+                    detectionState = state,
+                    isWarmingUp    = isWarmingUp,
+                    onStart        = { viewModel.startDetection() },
+                    onStop         = { viewModel.stopDetection()  },
+                    onReset        = { viewModel.reset()          },
+                    onConfirm      = { viewModel.confirmWord()    },
+                    modifier       = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                )
+            }
         }
     }
 }

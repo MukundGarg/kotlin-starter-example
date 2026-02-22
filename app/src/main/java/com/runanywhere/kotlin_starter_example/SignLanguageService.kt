@@ -1,14 +1,13 @@
-// ─── TASK-008: DetectionState sealed class defined at top of file ─────────────
 // ─── TASK-009: SignLanguageService — pipeline mediator, SupervisorJob scope, ──
 //              frame collection, detector calls, result routing
 // Changes:
-//   • DetectionState drives the full state machine (Idle → Detecting →
-//     Processing → Detecting → …)
-//   • SupervisorJob scope means one failed detection coroutine does NOT cancel the pipeline
-//   • releaseFrame() is ALWAYS called in a finally block — any other placement
-//     causes the AtomicBoolean gate to deadlock and freezes the camera
-//   • 500ms inter-frame delay caps VLM API calls at ~2/sec, preventing overheating
-//   • rawConfidence resets to 0.0 when a frame returns null (hand not visible)
+//   • FIXED: Detection pipeline wiring. The gate (isDetectionRunning) is now
+//     correctly toggled by startPipeline() and stopDetection().
+//   • SINGLE BINDING: The frame collection loop runs continuously to keep the 
+//     preview active, but only routes frames to the classifier when 
+//     isDetectionRunning is true.
+//   • Always call cameraManager.releaseFrame() to allow the next frame to be 
+//     captured, even if processing is skipped.
 // ──────────────────────────────────────────────────────────────────────────────
 
 package com.runanywhere.kotlin_starter_example
@@ -33,38 +32,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TASK-008 — DetectionState sealed class
-//
-// Drives the state machine inside SignLanguageService.
-// The ViewModel observes this to show the correct UI state.
-//
-// Flow:
-//   Idle → Detecting → Processing → Detecting → …
-//                                 ↘ BufferingWord → WordComplete
-//                                 ↘ Error
-// ─────────────────────────────────────────────────────────────────────────────
 sealed class DetectionState {
-    // Camera bound, no detection running
     object Idle : DetectionState()
-
-    // Frame emitted from camera, waiting for VLM response
     object Detecting : DetectionState()
-
-    // VLM call is currently in-flight
     object Processing : DetectionState()
-
-    // One or more letters committed, word is being built
     data class BufferingWord(val partial: String) : DetectionState()
-
-    // confirmWord() called — word is finalised and added to history
     data class WordComplete(val word: String) : DetectionState()
-
-    // Unrecoverable error in the pipeline (shown to UI, pipeline continues)
     data class Error(val message: String) : DetectionState()
 
-    // Human-readable label for Logcat
     override fun toString(): String = when (this) {
         is Idle          -> "Idle"
         is Detecting     -> "Detecting"
@@ -75,92 +52,69 @@ sealed class DetectionState {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TASK-009 — SignLanguageService
-//
-// Owns the CameraManager and SignLanguageDetector.
-// Mediates the frame gate, state machine, and result routing.
-// The ViewModel creates one instance and calls start/stop/release.
-// ─────────────────────────────────────────────────────────────────────────────
 class SignLanguageService(context: Context) {
 
     companion object {
         private const val TAG                  = "SignLanguageService"
-        private const val INTER_FRAME_DELAY_MS = 500L  // caps API at ~2 calls/sec
+        private const val INTER_FRAME_DELAY_MS = 500L
     }
 
-    // ── Dependencies ──────────────────────────────────────────────────────────
     private val cameraManager = CameraManager(context)
     private val detector      = SignLanguageDetector(context)
-
-    // ── SupervisorJob scope ───────────────────────────────────────────────────
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceScope  = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var detectionJob: Job? = null
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Exposed flows — collected by SignLanguageViewModel
-    // ─────────────────────────────────────────────────────────────────────────
 
     private val _state = MutableStateFlow<DetectionState>(DetectionState.Idle)
     val state: StateFlow<DetectionState> = _state.asStateFlow()
 
-    private val _detectionResults = MutableSharedFlow<DetectionResult>(
-        extraBufferCapacity = 8
-    )
+    private val _detectionResults = MutableSharedFlow<DetectionResult>(extraBufferCapacity = 8)
     val detectionResults: SharedFlow<DetectionResult> = _detectionResults.asSharedFlow()
 
     private val _rawConfidence = MutableStateFlow(0f)
     val rawConfidence: StateFlow<Float> = _rawConfidence.asStateFlow()
 
-    // ── State storage for TASK-013 ───────────────────────────────────────────
-    private var isDetectionRunning = false
+    private val isDetectionRunning = AtomicBoolean(false)
     private var lifecycleOwner: LifecycleOwner? = null
     private var previewView: PreviewView? = null
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // bindCameraAndStartStream() — SINGLE camera binding point
-    // 
-    // Called once when the screen is composed. Immediately binds the camera
-    // via frameStream() so preview is visible. Frames are collected but only
-    // processed when isDetectionRunning is true (set by startPipeline).
-    // ─────────────────────────────────────────────────────────────────────────
     fun bindCameraAndStartStream(
         lifecycleOwner : LifecycleOwner,
         previewView    : PreviewView,
         classifier     : IslHandClassifier? = null
     ) {
+        if (this.previewView === previewView && this.lifecycleOwner === lifecycleOwner && detectionJob?.isActive == true) {
+            Log.d(TAG, "Already bound — skipping redundant binding")
+            return
+        }
+
+        detectionJob?.cancel()
         this.lifecycleOwner = lifecycleOwner
         this.previewView = previewView
         
-        Log.d(TAG, "Binding camera and starting frame stream")
-        
-        // Start frame collection immediately
-        // This binds the camera (making preview visible)
-        // but frames are only processed when isDetectionRunning = true
         detectionJob = serviceScope.launch {
             cameraManager
                 .frameStream(lifecycleOwner, previewView)
                 .collect { frame ->
-                    // Only process frames when detection is active
-                    if (!isDetectionRunning) {
-                        Log.d(TAG, "Frame received but detection inactive — skipping")
+                    // Always check the gate
+                    if (!isDetectionRunning.get()) {
                         cameraManager.releaseFrame()
                         return@collect
                     }
                     
                     _state.value = DetectionState.Processing
-                    Log.d(TAG, "Frame received — calling detector")
+                    Log.v(TAG, "Processing frame...")
 
                     try {
+                        // Priority: Local Classifier → VLM Detector fallback
                         val result = classifier?.classify(frame.jpegBytes)
                             ?: detector.detectLetterWithConfidence(frame.jpegBytes)
                         handleResult(result)
                     } catch (e: Exception) {
-                        Log.e(TAG, "Detection error: ${e.message}", e)
+                        Log.e(TAG, "Detection error: ${e.message}")
                     } finally {
                         cameraManager.releaseFrame()
                         delay(INTER_FRAME_DELAY_MS)
-                        if (isDetectionRunning) {
+                        if (isDetectionRunning.get()) {
                             _state.value = DetectionState.Detecting
                         }
                     }
@@ -168,73 +122,44 @@ class SignLanguageService(context: Context) {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // startPipeline() — begins frame processing (camera already bound)
-    // ─────────────────────────────────────────────────────────────────────────
     fun startPipeline(classifier: IslHandClassifier? = null) {
-        if (isDetectionRunning) {
-            Log.d(TAG, "Detection already running — ignoring startPipeline()")
-            return
-        }
-
-        if (detectionJob == null) {
-            Log.w(TAG, "startPipeline called before camera binding — call bindCameraAndStartStream first")
-            return
-        }
-
-        Log.d(TAG, "Starting frame processing")
-        isDetectionRunning = true
+        if (isDetectionRunning.get()) return
+        Log.i(TAG, "Detection STARTED (gate opened)")
+        isDetectionRunning.set(true)
         _state.value = DetectionState.Detecting
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // stopDetection() — cancels the frame loop
-    // ─────────────────────────────────────────────────────────────────────────
     fun stopDetection() {
-        Log.d(TAG, "Stopping detection")
-        isDetectionRunning = false
-        detectionJob?.cancel()
-        detectionJob = null
-        _state.value  = DetectionState.Idle
+        Log.i(TAG, "Detection STOPPED (gate closed)")
+        isDetectionRunning.set(false)
+        _state.value = DetectionState.Idle
         _rawConfidence.value = 0f
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // notifyWordComplete() — called by ViewModel when confirmWord() is triggered
-    // ─────────────────────────────────────────────────────────────────────────
-    fun notifyWordComplete(word: String) {
-        _state.value = DetectionState.WordComplete(word)
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // notifyBuffering() — called by ViewModel as letters accumulate
-    // ─────────────────────────────────────────────────────────────────────────
-    fun notifyBuffering(partial: String) {
-        _state.value = DetectionState.BufferingWord(partial)
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // release() — shuts down the executor and unbinds the camera
-    // ─────────────────────────────────────────────────────────────────────────
     fun release() {
-        stopDetection()
+        isDetectionRunning.set(false)
+        detectionJob?.cancel()
+        detectionJob = null
         cameraManager.release()
         lifecycleOwner = null
         previewView = null
-        Log.d(TAG, "SignLanguageService released")
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // handleResult() — routes DetectionResult or null to the correct flows
-    // ─────────────────────────────────────────────────────────────────────────
     private suspend fun handleResult(result: DetectionResult?) {
         if (result != null) {
             _rawConfidence.value = result.confidence
             _detectionResults.emit(result)
-            Log.i(TAG, "Result routed → $result")
+            Log.d(TAG, "Result: ${result.letter} (${result.confidence})")
         } else {
             _rawConfidence.value = 0f
-            Log.d(TAG, "No detection this frame — confidence reset to 0")
         }
+    }
+
+    fun notifyWordComplete(word: String) {
+        _state.value = DetectionState.WordComplete(word)
+    }
+
+    fun notifyBuffering(partial: String) {
+        _state.value = DetectionState.BufferingWord(partial)
     }
 }
